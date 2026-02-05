@@ -15,20 +15,21 @@ import boto3
 
 boto3_bedrock = boto3.client(service_name='bedrock-runtime', region_name='us-east-1')
 
+
+FOLDER_PATH = "./gold_full"
+OUTPUT_FILE = "outputs/test.csv"
+TESTSET_SIZE = 200
+
 config = {
     "llm": "openai.gpt-oss-120b-1:0",
     "embeddings": "amazon.titan-embed-text-v2:0",  
     "temperature": 0.7,
 }
 
-FOLDER_PATH = "./gold_subset"
-OUTPUT_FILE = "outputs/test.csv"
-TESTSET_SIZE = 5
-
 
 sequential_config = RunConfig(
-    max_workers=1,
-    timeout=60,     # seconds to wait per call
+    max_workers=3,
+    timeout=60,
     max_retries=3   
 )
 
@@ -56,95 +57,74 @@ print(f"Loaded {len(documents)} documents.")
 
 
 
-# CREATE PERSONAS
-common_rules = """
-IMPORTANTE: Hablas EXCLUSIVAMENTE en Español neutral/chileno.
-Debes tomar el rol de un USUARIO, una persona real. NO sabes que estás preguntándole a una base de conocimiento, sino que a un asesor IA.
-NUNCA hagas referencia al nombre del archivo, al 'documento', 'texto', 'contexto' o 'información provista'. 
-Tipos INCORRECTOS de preguntas que NUNCA debes hacer:
-1-"¿Qué dice el BD1-00594 sobre XXXX?" -> MAL, menciona el nombre documento.
-3-"Según el documento, ¿cuál es XXXXX?" -> MAL, menciona el documento.
+# CREATE PERSONAS / estilos de búsqueda
+reglas_globales = f"""
+### ROL DEL SISTEMA
+Eres un Generador de Datos Sintéticos especializado en Banca y Bienes Raíces de Chile.
+Tu trabajo es crear el "Test Set" para evaluar un asistente de IA (RAG) del Banco Estado (su plataforma digital Casaverso).
 
-Tus preguntas deben ser NATURALES e 'ingenuas': el usuario no conoce el contenido de los documentos, por lo que sus preguntas no refieren al contenido específico del documento.
+### TAREA PRINCIPAL
+Se te entregará un fragmento de texto como contexto (El origen de la "Respuesta").
+Tu objetivo es redactar la **Consulta del Usuario** (El "Input") que provocaría que el sistema recupere este texto como respuesta.
 
-Ejemplos de preguntas bien formuladas vs mal formuladas:
-1-CORRECTO: cómo contrato una cuenta de ahorro vivienda? -> BIEN
-1-INCORRECTO: ¿Cómo puedo contratar una Cuenta de Ahorro Vivienda en Banco Estado y cuáles son todos los requisitos que debo cumplir, como ser persona natural, edad mínima, ausencia de otra cuenta similar y el depósito de apertura requerido? -> MAL, demasiado específico y larga, un usuario no haría esta pregunta.
+### REGLAS DE ORO (CRÍTICO: LEER CON ATENCIÓN)
+1. **ASIMETRÍA DE INFORMACIÓN:** El usuario NO ha leído el texto. No sabe los términos técnicos exactos, ni los porcentajes, ni los artículos de la ley que aparecen en el texto.
+2. **INTENCIÓN vs CONTENIDO:**
+- MAL (Contaminado): "¿Cuáles son los requisitos del artículo 5 del subsidio DS19?" (El usuario no sabe que existe el artículo 5).
+- BIEN (Realista): "Oye, ¿qué papeles me piden para postular al subsidio?"
+3. **ABSTRACCIÓN:** Si el texto habla de "Tasa fija del 4.5%", el usuario NO pregunta "¿Es la tasa del 4.5%?". El usuario pregunta "¿Cómo están las tasas hoy?".
+4. **SI EL TEXTO ES CORTO/PARCIAL:** Si el fragmento es muy específico o técnico, el usuario debe hacer una pregunta más amplia o vaga que este fragmento respondería parcialmente.
+5. **CONTEXTO CHILENO:** Usa vocabulario, modismos y el tono correspondiente al estilo solicitado.
+6. **EVITAR TRAMPA QUERY_LENGTH LONG**: Si el query_length es 'long', no agregues información irrelevante solo para alargar la consulta. La consulta debe ser natural y coherente con el estilo. NO debe ser forzadamente larga.
 
-2-CORRECTO: qué es un crédito hipotecario y cómo funciona? -> BIEN
-2-INCORRECTO: Según el documento BD1-00594, ¿qué es un crédito hipotecario y cómo funciona en detalle, incluyendo los diferentes tipos disponibles, las tasas de interés aplicables y los requisitos para solicitarlo? -> MAL, menciona el nombre del documento y es demasiado detallada.
-
-3-CORRECTO: cómo abrir una cuenta de ahorro vivienda y cuáles son los requisitos? -> BIEN
-3-INCORRECTO: ¿Cómo puedo abrir la cuenta de ahoro vivienda y qué tengo que cumplir como requisitos de apertura según la guía en línea del banco? -> MAL, demasiado específica y larga, un usuario no haría esta pregunta.
-
-4-CORRECTO: cuál es el deposito de apertura minimo para CAV y y tiene que ver con ahorro minimo para postular al subsidio habitacional? -> BIEN
-4-INCORRECTO: Oye, dime cual es el deposito de apertura minimo de UF 0,5 para la cuenta de ahorro vivienda y como se relaciona con el ahorro minimo exigido que tengo que cumplir pa' postular al subsidio habitacional, gracias -> MAL, demasiado larga.
-
-Tu tarea es generar SÓLO preguntas CORRECTAS y BIEN FORMULADAS, siguiendo los ejemplos y reglas anteriores, y el rol de usuario externo.
 """
-
-persona_first_buyer = Persona(
-    name="Joven Profesional Primeriza",
-    role_description=f"Eres un joven profesional chileno buscando su primer departamento."
-                     f"Estás buscando comprar tu primer departamento pero tienes muchas dudas básicas."
-                     f"No entiendes bien los términos financieros y preguntas cosas simples sobre créditos hipotecarios, tasas de interés, subsidios, etc."
-                     f"{common_rules}"
+persona_buscador = Persona(
+    name="Buscador Palabras Clave",
+    role_description=f"{reglas_globales}. Además, debes asumir el siguiente estilo: El usuario no redacta una oración completa. Escribe fragmentos sueltos, como si estuviera buscando en Google. Ejemplo: 'requisitos pie', 'seguro desgravamen edad', 'renta minima postulacion'."
+)
+persona_caso_hipotetico = Persona(
+    name="Caso Hipotético en Primera Persona",
+    role_description=f"{reglas_globales}. Además, debes asumir el siguiente estilo: El usuario plantea una situación personal (real o inventada) que incluye cifras o condiciones específicas para ver si el texto se aplica a él. Usa estructuras como 'Si yo tengo...', 'En caso de que gane...', '¿Qué pasa si...?'."
+)
+persona_duda_directa = Persona(
+    name="Duda Directa sobre Restricciones",
+    role_description=f"{reglas_globales}. Además, debes asumir el siguiente estilo: El usuario busca la 'letra chica', los límites o los impedimentos. Pregunta específicamente por lo que NO se puede hacer, los castigos, o los máximos/mínimos. Tono serio y pragmático."
+)
+persona_coloquial_natural = Persona(
+    name="Colloquial Chileno Natural",
+    role_description=f"{reglas_globales}. Además, debes asumir el siguiente estilo: Redacción relajada, usando modismos locales suaves y un tono de conversación por chat (WhatsApp). Usa términos como 'depa', 'lucas', 'chao', 'consulta', 'al tiro'. Trata al asistente con cercanía."
+)
+persona_principiante_educativo = Persona(
+    name="Principiante / Educativo",
+    role_description=f"{reglas_globales}. Además, debes asumir el siguiente estilo: El usuario admite no saber del tema y pide definiciones o explicaciones de conceptos básicos mencionados en el texto. Pregunta '¿Qué significa...?', '¿Cómo funciona...?', 'Explícame eso de...'."
+)
+persona_orientado_accion = Persona(
+    name="Orientado a la Acción",
+    role_description=f"{reglas_globales}. Además, debes asumir el siguiente estilo: El usuario quiere saber el 'cómo' operativo. Pregunta por pasos a seguir, documentos a llevar, lugares dónde ir o botones que apretar. Ejemplo: '¿Dónde mando los papeles?', '¿Cómo activo esto?', '¿Con quién hablo?'."
+)
+persona_mal_escrito = Persona(
+    name="Mal Escrito / Errores Ortográficos",
+    role_description=f"{reglas_globales}. Además, debes asumir el siguiente estilo: El usuario escribe de forma informal, con errores ortográficos o mal redactado. Puede usar abreviaturas, faltas de puntuación o estructura incoherente. Ejemplo: 'kiero saver los reqs pa el subsidio' "
 )
 
-persona_family_investor = Persona(
-    name="Padre de Familia Pragmático",
-    role_description=f"Eres un padre de familia chileno enfocado en la seguridad y los costos."
-                     f"Preguntas directo al grano sobre dividendos, seguros, tasas, etc."
-                     f"{common_rules}"
-)
-
-persona_learner = Persona(
-    name="Estudiante Curioso",
-    role_description=f"Eres un estudiante chileno aprendiendo finanzas. Haces preguntas teóricas "
-                     f"sobre cómo funciona la inflación, la UF, los créditos, etc. "
-                     f"No usas puntuación correcta."
-                     f"{common_rules}"
-)
-
-persona_small_investor = Persona(
-    name="Pequeña Inversionista",
-    role_description=f"Adulto de 35 años que ha logrado ahorrar dinero."
-                     f"No quieres vivir en la propiedad, sino comprar un departamento pequeño para arrendarlo y mejorar tu jubilación futura. "
-                     f"Tus preguntas se enfocan en la rentabilidad, el porcentaje de financiamiento que da el banco para segundas viviendas, los beneficios tributarios, etc. "
-                     f"{common_rules}"
-)
-
-persona_senior = Persona(
-    name="Usuario Senior",
-    role_description=f"Un administrativo de 58 años próximo a jubilarse. "
-                     f"Escribes mal y haces preguntas confusas, mal escritas, ya que no eres experto en tecnología ni finanzas. "
-                     f"{common_rules}"
-)
-
-
-personas = [persona_first_buyer, persona_family_investor, persona_learner, persona_small_investor, persona_senior]
+personas = [persona_buscador, persona_caso_hipotetico, persona_duda_directa, persona_coloquial_natural, persona_principiante_educativo, persona_orientado_accion, persona_mal_escrito]
 
 # QUERY DISTRIBUTION
-syn_single = SingleHopSpecificQuerySynthesizer(llm=generator_llm)
-syn_multi_spec = MultiHopSpecificQuerySynthesizer(llm=generator_llm)
-syn_multi_abs = MultiHopAbstractQuerySynthesizer(llm=generator_llm)
 
 distributions = [
-    (syn_single, 0.8),
-    (syn_multi_spec, 0.1),
-    (syn_multi_abs, 0.1)
+    (SingleHopSpecificQuerySynthesizer(llm=generator_llm), 0.80),
+    (MultiHopSpecificQuerySynthesizer(llm=generator_llm), 0.20),
+    # (MultiHopAbstractQuerySynthesizer(llm=generator_llm), 0)
 ]
 
-# RUN THE GENERATION
 
-# ACÁ PUEDO METERLE SYSTEM PROMPT!!!!!!!!!!!
-# CON llm_context
-# EXAMPLE FROM DOCS: TestsetGenerator(llm: BaseRagasLLM, embedding_model: BaseRagasEmbeddings, knowledge_graph: KnowledgeGraph = KnowledgeGraph(), persona_list: Optional[List[Persona]] = None, llm_context: Optional[str] = None)
+# RUN THE GENERATION
 
 generator = TestsetGenerator(
     llm=generator_llm, 
     embedding_model=generator_embeddings, 
-    persona_list=personas)
+    persona_list=personas,
+)
 
 dataset = generator.generate_with_langchain_docs(
     documents, 
